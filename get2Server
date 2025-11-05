@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+import os, sys, time, pathlib, random, requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from requests.exceptions import SSLError, RequestException
+
+# ===== 환경 변수 기본값 =====
+BASE_URL   = os.getenv("RELAY_BASE",   "")
+SESSION_ID = os.getenv("RELAY_SESSION","")
+TOKEN      = os.getenv("RELAY_TOKEN",  "")
+TIMEOUT_S  = float(os.getenv("RELAY_TIMEOUT", "10"))
+OUTDIR     = pathlib.Path(os.getenv("RELAY_OUTDIR", "./downloads")).resolve()
+
+# TLS / 프록시
+VERIFY = True
+cafile = os.getenv("REQUESTS_CA_BUNDLE", "")
+if cafile: VERIFY = cafile
+if os.getenv("INSECURE","").lower() in ("1","true","yes"):
+    VERIFY = False
+
+proxies = {}
+if os.getenv("HTTP_PROXY"):  proxies["http"]  = os.getenv("HTTP_PROXY")
+if os.getenv("HTTPS_PROXY"): proxies["https"] = os.getenv("HTTPS_PROXY")
+
+# 인증/기본 헤더
+BASE_HDRS = {
+    "X-Relay-Token": TOKEN
+} if TOKEN else {}
+
+# 출력 폴더
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+# ===== 전역 세션 =====
+_session = requests.Session()
+# 재시도 정책(필요 시 조정): 5xx/일시 네트워크만 재시도
+_retry = Retry(
+    total=3, backoff_factor=0.2,
+    status_forcelist=(502, 503, 504),
+    allowed_methods=frozenset(["GET","POST"])
+)
+_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=_retry)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
+_session.verify = VERIFY
+_session.proxies = proxies
+_session.headers.update(BASE_HDRS)
+# JSON 압축 수용(서버가 지원하면 트래픽↓)
+_session.headers.setdefault("Accept", "application/json")
+_session.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+
+def guess_ext_from_mime(mime: str) -> str:
+    m = (mime or "").lower()
+    return { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp" }.get(m, ".bin")
+
+# ===== 업스트림 API =====
+def get_task():
+    """ /task: 작업 없으면 204 → None, 작업 있으면 dict """
+    url = f"{BASE_URL}/task"
+    params = {"session": SESSION_ID, "timeout": TIMEOUT_S}
+    r = _session.get(url, params=params, timeout=(5, TIMEOUT_S+5))
+    if r.status_code == 204:
+        return None
+    r.raise_for_status()
+    if not r.content:
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+def write_meta_sidecar(req_id: str, prompt: str, mime: str, image_url: str):
+    sidecar = OUTDIR / f"{req_id}.json"
+    data = {
+        "req_id": req_id, "prompt": prompt or "",
+        "mime": mime or "", "image_url": image_url or "",
+        "saved_at": int(time.time())
+    }
+    tmp = sidecar.with_suffix(".json.part")
+    import json
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, sidecar)
+    return sidecar
+
+def download_image(req_id: str, mime: str, image_url: str) -> pathlib.Path:
+    url = f"{BASE_URL}{image_url}" if image_url.startswith("/") else image_url
+    ext = guess_ext_from_mime(mime)
+    outpath = OUTDIR / f"{req_id}{ext}"
+    tmppath = OUTDIR / f".{req_id}{ext}.part"
+
+    # 청크 크기 키움(64KB)
+    CHUNK = 65536
+    with _session.get(url, stream=True, timeout=(5, 60)) as r:
+        r.raise_for_status()
+        with tmppath.open("wb") as f:
+            for chunk in r.iter_content(CHUNK):
+                if chunk: f.write(chunk)
+    os.replace(tmppath, outpath)
+    return outpath
+
+def post_result(req_id: str, text: str):
+    url = f"{BASE_URL}/result"
+    payload = {"session": SESSION_ID, "req_id": req_id, "text": text}
+    r = _session.post(url, json=payload, timeout=(5, 30))
+    r.raise_for_status()
+    return r.json()
+
+def single_shot():
+    try:
+        task = get_task()
+    except SSLError as e:
+        print(f"[SSL ERR] {e}", file=sys.stderr); return 2
+    except RequestException as e:
+        print(f"[ERR] /task failed: {e}", file=sys.stderr); return 2
+
+    if task is None:
+        return 1
+
+    req_id    = (task.get("req_id") or "").strip()
+    prompt    = task.get("prompt") or ""
+    mime      = task.get("mime", "image/jpeg")
+    image_url = task.get("image_url") or ""
+
+    if not req_id:
+        print(f"[WARN] missing req_id: {task}", file=sys.stderr)
+        return 1
+
+    try:
+        sidecar = write_meta_sidecar(req_id, prompt, mime, image_url)
+        print(f"[OK] sidecar: {sidecar}")
+    except Exception as e:
+        print(f"[ERR] sidecar: {e}", file=sys.stderr)
+
+    try:
+        img_path = download_image(req_id, mime, image_url)
+    except SSLError as e:
+        print(f"[SSL ERR] {e}", file=sys.stderr); return 2
+    except RequestException as e:
+        print(f"[ERR] download failed: {e}", file=sys.stderr); return 2
+
+    print(f"[OK] image: {img_path}")
+    return 0
+
+def loop_mode():
+    print(f"[INFO] LOOP BASE={BASE_URL} SESSION={SESSION_ID} TIMEOUT={TIMEOUT_S}s VERIFY={_session.verify}")
+    backoff_ms = 100  # 204일 때 시작 딜레이
+    while True:
+        rc = single_shot()
+        if rc == 1:
+            # 작업 없음: 점진 백오프 최대 500ms
+            time.sleep(backoff_ms/1000.0)
+            backoff_ms = min(500, backoff_ms + 100)
+        else:
+            # 작업 처리됨/에러: 즉시 재시도(미세 쉼)
+            backoff_ms = 100
+            time.sleep(0.05)
+
+def parse_args():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--loop", action="store_true", help="지속 폴링 모드")
+    ap.add_argument("--insecure", action="store_true", help="TLS 검증 끄기(테스트용)")
+    ap.add_argument("--cafile", type=str, default=os.getenv("REQUESTS_CA_BUNDLE", ""), help="사내 루트CA PEM")
+    ap.add_argument("--https-proxy", type=str, default=os.getenv("HTTPS_PROXY", ""), help="https 프록시 URL")
+    ap.add_argument("--http-proxy", type=str, default=os.getenv("HTTP_PROXY", ""), help="http 프록시 URL")
+    return ap.parse_args()
+
+def main():
+    global VERIFY, proxies
+    args = parse_args()
+
+    # 세션 설정 갱신(런타임 스위치 지원)
+    _session.verify = False if args.insecure else (args.cafile if args.cafile else _session.verify)
+
+    new_proxies = {}
+    if args.http_proxy:  new_proxies["http"]  = args.http_proxy
+    if args.https_proxy: new_proxies["https"] = args.https_proxy
+    if new_proxies: _session.proxies = new_proxies
+
+    if args.loop:
+        loop_mode()
+    else:
+        sys.exit(single_shot())
+
+if __name__ == "__main__":
+    main()
+
